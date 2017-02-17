@@ -18,6 +18,7 @@
 
 from __future__ import print_function
 
+import datetime
 import json
 import os
 import sys
@@ -296,7 +297,8 @@ class ImageService(HTTPService):
         Yields a series of images as dicts containing metadata.
         """
         if params is None:
-            params = {'is_public': None}
+            params = {'changes-since': datetime.datetime(2000, 1, 1),
+                      'is_public': None}
 
         while True:
             url = '/v1/images/detail'
@@ -394,22 +396,32 @@ def _human_readable_size(num, suffix='B'):
 
 
 def replication_test(options, args):
+    from pprint import pprint
     master_auth_service = AuthService(options.master.auth_url,
                                       options.master.username,
                                       options.master.password,
                                       options.master.project_name)
 
-    master_project_service = ProjectService(options.master.keystone_admin_url,
-                                            master_auth_service)
-    print(master_project_service.get_projects())
+    master_client = ImageService(options.master.glance_url, master_auth_service)
+    pprint([i for i in master_client.get_images(
+        params={
+            "changes-since": datetime.datetime(2000, 1, 1),
+            'is_public': None
+        }
+    )])
 
     slave_auth_service = AuthService(options.slave.auth_url,
                                      options.slave.username,
                                      options.slave.password,
                                      options.slave.project_name)
-    slave_project_service = ProjectService(options.slave.keystone_admin_url,
-                                           slave_auth_service)
-    print(slave_project_service.get_projects())
+
+    slave_client = ImageService(options.slave.glance_url, slave_auth_service)
+    pprint([i for i in slave_client.get_images(
+        params={
+            "changes-since": datetime.datetime(2000, 1, 1),
+            'is_public': None
+        }
+    )])
 
 
 def replication_size(options, args):
@@ -640,29 +652,35 @@ def replication_livecopy(options, args):
         slave_id = slave_project_service.get_name_or_id(master_name)
         image['owner'] = slave_id
         if _image_present(slave_client, image_id):
-            # NOTE(mikal): Perhaps we just need to update the metadata?
-            # Note that we don't attempt to change an image file once it
-            # has been uploaded.
-            master_headers = master_client.get_image_meta(image_id)
-            for key in set(master_headers.keys()).difference(image.keys()):
-                del master_headers[key]
             slave_headers = slave_client.get_image_meta(image_id)
-            for key in set(slave_headers.keys()).difference(image.keys()):
-                del slave_headers[key]
-            master_headers['owner'] = master_project_service.get_name_or_id(
-                master_headers['owner'])
-            slave_headers['owner'] = slave_project_service.get_name_or_id(
-                slave_headers['owner'])
-            if (slave_headers['status'] == 'active' and
-                    _dict_diff(master_headers, slave_headers)):
-                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                             'metadata has changed'),
-                         {'image_id': image_id,
-                          'image_name': image.get('name', '--unnamed--')})
-                slave_headers, body = slave_client.add_image_meta(image)
-                _check_upload_response_headers(slave_headers, body)
-                updated.append(image['id'])
-
+            if slave_headers['status'] != 'deleted':
+                if image['deleted']:
+                    slave_client.delete_image(image_id)
+                else:
+                    # NOTE(mikal): Perhaps we just need to update the metadata?
+                    # Note that we don't attempt to change an image file once it
+                    # has been uploaded.
+                    master_headers = master_client.get_image_meta(image_id)
+                    for key in set(master_headers.keys()).difference(
+                            image.keys()):
+                        del master_headers[key]
+                    for key in set(slave_headers.keys()).difference(
+                            image.keys()):
+                        del slave_headers[key]
+                    master_headers['owner'] = master_project_service.\
+                        get_name_or_id(master_headers['owner'])
+                    slave_headers['owner'] = slave_project_service.\
+                        get_name_or_id(slave_headers['owner'])
+                    if (slave_headers['status'] == 'active' and
+                            _dict_diff(master_headers, slave_headers)):
+                        LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                                     'metadata has changed'),
+                                 {'image_id': image_id,
+                                  'image_name': image.get('name',
+                                                          '--unnamed--')})
+                        slave_headers, body = slave_client.add_image_meta(image)
+                        _check_upload_response_headers(slave_headers, body)
+                        updated.append(image['id'])
         elif image['status'] == 'active':
             LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
                          '(%(image_size)d bytes) '
