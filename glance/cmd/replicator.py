@@ -21,13 +21,21 @@ from __future__ import print_function
 import datetime
 import json
 import os
+import select
+try:
+    import SocketServer
+except ImportError:
+    import socketserver as SocketServer
 import sys
+import threading
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
+from oslo_utils import netutils
 from oslo_utils import uuidutils
+import paramiko
 import six
 from six.moves import http_client as http
 import six.moves.urllib.parse as urlparse
@@ -39,6 +47,8 @@ from glance.common import utils
 from glance.i18n import _, _LE, _LI, _LW
 
 LOG = logging.getLogger(__name__)
+
+SSH_PORT = 22
 
 
 # NOTE: positional arguments <args> will be parsed before <command> until
@@ -64,27 +74,29 @@ cli_opts = [
                     help="Arguments for the command")
 ]
 
-master_opts = [
+base_opts = [
     cfg.StrOpt('auth_url', default=None),
     cfg.StrOpt('username', default=None),
     cfg.StrOpt('password', default=None),
     cfg.StrOpt('project_name', default=None),
-    cfg.StrOpt('glance_url', default=None),
-    cfg.StrOpt('keystone_admin_url', default=None),
+    cfg.StrOpt('glance_url', default=None)
 ]
-slave_opts = [
-    cfg.StrOpt('auth_url', default=None),
+keystone_admin_url_opts = [
+    cfg.StrOpt('url', default=None),
+    cfg.BoolOpt('use_ssh_tunnel', default=False),
+    cfg.IntOpt('local_port', default=None),
     cfg.StrOpt('username', default=None),
     cfg.StrOpt('password', default=None),
-    cfg.StrOpt('project_name', default=None),
-    cfg.StrOpt('glance_url', default=None),
-    cfg.StrOpt('keystone_admin_url', default=None),
+    cfg.StrOpt('keyfile', default=None),
+    cfg.StrOpt('ssh_server', default=None)
 ]
 
 CONF = cfg.CONF
 CONF.register_cli_opts(cli_opts)
-CONF.register_opts(master_opts, 'master')
-CONF.register_opts(slave_opts, 'slave')
+CONF.register_opts(base_opts, 'master')
+CONF.register_opts(keystone_admin_url_opts, 'master_keystone_admin_url')
+CONF.register_opts(base_opts, 'slave')
+CONF.register_opts(keystone_admin_url_opts, 'slave_keystone_admin_url')
 logging.register_options(CONF)
 CONF.set_default(name='use_stderr', default=True)
 
@@ -118,8 +130,13 @@ IMAGE_ALREADY_PRESENT_MESSAGE = _('The image %s is already present on '
 
 class HTTPService(object):
     def __init__(self, url):
-        server, port = utils.parse_valid_host_port(url)
-        self.conn = http.HTTPConnection(server, port)
+        schema, netloc, _, _, _ = netutils.urlsplit(url)
+        server, port = utils.parse_valid_host_port(netloc or url)
+        if schema.lower() == 'https':
+            cls = http.HTTPSConnection
+        else:
+            cls = http.HTTPConnection
+        self.conn = cls(server, port)
 
     @staticmethod
     def header_list_to_dict(headers):
@@ -387,6 +404,99 @@ class ImageService(HTTPService):
         return headers, body
 
 
+class ForwardServer(SocketServer.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class Handler(SocketServer.BaseRequestHandler):
+
+    def handle(self):
+        try:
+            chan = self.ssh_transport.open_channel(
+                'direct-tcpip', (self.chain_host, self.chain_port),
+                self.request.getpeername())
+        except Exception as e:
+            LOG.debug('Incoming request to %s:%d failed: %s' % (self.chain_host,
+                                                              self.chain_port,
+                                                              repr(e)))
+            return
+        if chan is None:
+            LOG.debug('Incoming request to %s:%d was rejected by the SSH '
+                      'server.' % (self.chain_host, self.chain_port))
+            return
+
+        LOG.debug('Connected! Tunnel open %r -> %r -> %r' % (
+            self.request.getpeername(),chan.getpeername(),
+            (self.chain_host, self.chain_port)))
+        while True:
+            r, w, x = select.select([self.request, chan], [], [])
+            if self.request in r:
+                data = self.request.recv(1024)
+                if len(data) == 0:
+                    break
+                chan.send(data)
+            if chan in r:
+                data = chan.recv(1024)
+                if len(data) == 0:
+                    break
+                self.request.send(data)
+
+        peername = self.request.getpeername()
+        chan.close()
+        self.request.close()
+        LOG.debug('Tunnel closed from %r' % (peername,))
+
+
+def forward_tunnel(options):
+    server_host, server_port = netutils.parse_host_port(options.ssh_server,
+                                                        SSH_PORT)
+    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
+    remote_host, remote_port = utils.parse_valid_host_port(netloc or
+                                                           options.url)
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.WarningPolicy())
+
+    LOG.info('Connecting to ssh host %s:%d ...' % (server_host, server_port))
+    try:
+        client.connect(server_host, server_port,
+                       username=options.username,
+                       key_filename=options.keyfile or None,
+                       password=options.password or None,
+                       look_for_keys=True)
+    except Exception as e:
+        LOG.error('*** Failed to connect to %s:%d: %r' % (server_host,
+                                                          server_port, e))
+        raise
+
+    LOG.info('Now forwarding port %d to %s:%d ...' % (options.local_port,
+                                                      remote_host,
+                                                      remote_port))
+
+    # this is a little convoluted, but lets me configure things for the Handler
+    # object.  (SocketServer doesn't give Handlers any way to access the outer
+    # server normally.)
+    class SubHander(Handler):
+        chain_host = remote_host
+        chain_port = remote_port
+        ssh_transport = client.get_transport()
+    srv = ForwardServer(('', options.local_port), SubHander)
+    srv.serve_forever()
+
+
+def run_ssh(options):
+    if not options.use_ssh_tunnel:
+        return options.url
+
+    thread = threading.Thread(target=forward_tunnel,
+                              kwargs={'options': options})
+    thread.daemon = True
+    thread.start()
+    schema = 'https' if options.url.lower().startswith('https') else 'http'
+    return '%s://127.0.0.1:%d' % (schema, options.local_port)
+
+
 def _human_readable_size(num, suffix='B'):
     for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
         if abs(num) < 1024.0:
@@ -621,7 +731,6 @@ def replication_livecopy(options, args):
     Load the contents of one glance instance into another.
 
     """
-
     master_auth_service = AuthService(options.master.auth_url,
                                       options.master.username,
                                       options.master.password,
@@ -634,10 +743,15 @@ def replication_livecopy(options, args):
     master_client = ImageService(options.master.glance_url, master_auth_service)
     slave_client = ImageService(options.slave.glance_url, slave_auth_service)
 
-    master_project_service = ProjectService(options.master.keystone_admin_url,
-                                            master_auth_service)
-    slave_project_service = ProjectService(options.slave.keystone_admin_url,
-                                           slave_auth_service)
+    master_keystone_admin_url = run_ssh(options.master_keystone_admin_url)
+    slave_keystone_admin_url = run_ssh(options.slave_keystone_admin_url)
+
+    master_project_service = ProjectService(
+        master_keystone_admin_url,
+        master_auth_service)
+    slave_project_service = ProjectService(
+        slave_keystone_admin_url,
+        slave_auth_service)
     updated = []
 
     for image in master_client.get_images():
@@ -704,10 +818,8 @@ def replication_livecopy(options, args):
 def replication_compare(options, args):
     """%(prog)s compare <fromserver:port> <toserver:port>
 
-    Compare the contents of fromserver with those of toserver.
+    Compare the contents of master with those of slave.
 
-    fromserver:port: the location of the master glance instance.
-    toserver:port:   the location of the slave glance instance.
     """
 
     master_auth_service = AuthService(options.master.auth_url,
@@ -722,10 +834,15 @@ def replication_compare(options, args):
     master_client = ImageService(options.master.glance_url, master_auth_service)
     slave_client = ImageService(options.slave.glance_url, slave_auth_service)
 
-    master_project_service = ProjectService(options.master.keystone_admin_url,
-                                            master_auth_service)
-    slave_project_service = ProjectService(options.slave.keystone_admin_url,
-                                           slave_auth_service)
+    master_keystone_admin_url = run_ssh(options.master_keystone_admin_url)
+    slave_keystone_admin_url = run_ssh(options.slave_keystone_admin_url)
+
+    master_project_service = ProjectService(
+        master_keystone_admin_url,
+        master_auth_service)
+    slave_project_service = ProjectService(
+        slave_keystone_admin_url,
+        slave_auth_service)
 
     differences = {}
 
@@ -870,10 +987,8 @@ def main():
 
     try:
         command(CONF, CONF.args)
-    except TypeError as e:
-        LOG.error(_LE(command.__doc__) % {'prog': command.__name__})  # noqa
-        sys.exit("ERROR: %s" % encodeutils.exception_to_unicode(e))
-    except ValueError as e:
+    except Exception as e:
+        LOG.exception(e)
         LOG.error(_LE(command.__doc__) % {'prog': command.__name__})  # noqa
         sys.exit("ERROR: %s" % encodeutils.exception_to_unicode(e))
 
