@@ -279,11 +279,20 @@ class ProjectService(HTTPService):
             return super(ProjectService, self).request(method, url, headers,
                                                        body, ignore_result_body)
 
+    def get_tenants(self, domain_id):
+        url = '/v3/projects?domain_id=%s' % domain_id
+        return json.loads(self.request('GET', url, {}, '').read())['projects']
+
+    def get_domains(self):
+        return json.loads(self.request('GET', '/v3/domains', {}, '').read()
+                          )['domains']
+
     def _init_projects(self):
-        result = json.loads(self.request('GET', '/v2.0/tenants', {}, '').read())
-        for tenant in result['tenants']:
-            self._projects[tenant['id']] = tenant['name']
-            self._projects[tenant['name']] = tenant['id']
+        for domain in self.get_domains():
+            for tenant in self.get_tenants(domain['id']):
+                name = '%s/%s' % (domain['name'], tenant['name'])
+                self._projects[tenant['id']] = name
+                self._projects[name] = tenant['id']
 
     def get_name_or_id(self, project_name_or_id):
         return self._projects.get(project_name_or_id)
