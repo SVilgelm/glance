@@ -358,8 +358,9 @@ class ImageService(HTTPService):
 
         Returns: a http_client Response object where the body is the image.
         """
+        self.add_image_meta({'id': image_uuid, 'protected': False})
         url = '/v1/images/%s' % image_uuid
-        return self.request('DELETE', url, {}, '')
+        return self.request('DELETE', url, {}, '', ignore_result_body=True)
 
     def get_image_meta(self, image_uuid):
         """Return the metadata for a single image.
@@ -504,6 +505,42 @@ def run_ssh(options):
     thread.start()
     schema = 'https' if options.url.lower().startswith('https') else 'http'
     return '%s://127.0.0.1:%d' % (schema, options.local_port)
+
+
+def delete_image_from_database(options, image_id):
+    server_host, server_port = netutils.parse_host_port(options.ssh_server,
+                                                        SSH_PORT)
+    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.WarningPolicy())
+
+    LOG.info('Connecting to ssh host %s:%d ...' % (server_host, server_port))
+    try:
+        client.connect(server_host, server_port,
+                       username=options.username,
+                       key_filename=options.keyfile or None,
+                       password=options.password or None,
+                       look_for_keys=True)
+    except Exception as e:
+        LOG.error('*** Failed to connect to %s:%d: %r' % (server_host,
+                                                          server_port, e))
+        raise
+    SQL_COMMANDS = [
+        "delete from image_locations where image_id='%(id)s';",
+        "delete from image_members where image_id='%(id)s';",
+        "delete from image_tags where image_id='%(id)s';",
+        "delete from image_properties where image_id='%(id)s';",
+        "delete from images where id='%(id)s';"
+    ]
+    cmd = 'echo "%s" | mysql glance'
+    for sql in SQL_COMMANDS:
+        sql = sql % {'id': image_id}
+        LOG.debug(cmd % sql)
+        _stdin, stdout, stderr = client.exec_command(cmd % sql, get_pty=True)
+        LOG.debug(stdout.read())
+        LOG.debug(stderr.read())
+    client.close()
 
 
 def _human_readable_size(num, suffix='B'):
@@ -776,35 +813,55 @@ def replication_livecopy(options, args):
         image['owner'] = slave_id
         if _image_present(slave_client, image_id):
             slave_headers = slave_client.get_image_meta(image_id)
-            if slave_headers['status'] != 'deleted':
-                if image['deleted']:
-                    slave_client.delete_image(image_id)
-                else:
-                    # NOTE(mikal): Perhaps we just need to update the metadata?
-                    # Note that we don't attempt to change an image file once it
-                    # has been uploaded.
-                    master_headers = master_client.get_image_meta(image_id)
-                    for key in set(master_headers.keys()).difference(
-                            image.keys()):
-                        del master_headers[key]
-                    for key in set(slave_headers.keys()).difference(
-                            image.keys()):
-                        del slave_headers[key]
-                    master_headers['owner'] = master_project_service.\
-                        get_name_or_id(master_headers['owner'])
-                    slave_headers['owner'] = slave_project_service.\
-                        get_name_or_id(slave_headers['owner'])
-                    if (slave_headers['status'] == 'active' and
-                            _dict_diff(master_headers, slave_headers)):
-                        LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                                     'metadata has changed'),
-                                 {'image_id': image_id,
-                                  'image_name': image.get('name',
-                                                          '--unnamed--')})
-                        slave_headers, body = slave_client.add_image_meta(image)
-                        _check_upload_response_headers(slave_headers, body)
-                        updated.append(image['id'])
-        elif image['status'] == 'active':
+            if slave_headers['status'] == 'deleted':
+                continue
+
+            if image['deleted']:
+                slave_client.delete_image(image_id)
+                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                             'has been deleted'),
+                         {'image_id': image_id,
+                          'image_name': image.get('name',
+                                                  '--unnamed--')})
+                continue
+            elif slave_headers['status'] == 'killed':
+                LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
+                                ' from the database'),
+                            {'image_id': image_id,
+                             'image_name': image.get('name',
+                                                     '--unnamed--')})
+
+                slave_client.delete_image(image_id)
+                delete_image_from_database(options.slave_keystone_admin_url,
+                                           image_id)
+            else:
+                # NOTE(mikal): Perhaps we just need to update the metadata?
+                # Note that we don't attempt to change an image file once it
+                # has been uploaded.
+                master_headers = master_client.get_image_meta(image_id)
+                for key in set(master_headers.keys()).difference(
+                        image.keys()):
+                    del master_headers[key]
+                for key in set(slave_headers.keys()).difference(
+                        image.keys()):
+                    del slave_headers[key]
+                master_headers['owner'] = master_project_service.\
+                    get_name_or_id(master_headers['owner'])
+                slave_headers['owner'] = slave_project_service.\
+                    get_name_or_id(slave_headers['owner'])
+                if (slave_headers['status'] == 'active' and
+                        _dict_diff(master_headers, slave_headers)):
+                    LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                                 'metadata has changed'),
+                             {'image_id': image_id,
+                              'image_name': image.get('name',
+                                                      '--unnamed--')})
+                    slave_headers, body = slave_client.add_image_meta(image)
+                    _check_upload_response_headers(slave_headers, body)
+                    updated.append(image['id'])
+                continue
+
+        if image['status'] == 'active':
             LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
                          '(%(image_size)d bytes) '
                          'is being synced'),
