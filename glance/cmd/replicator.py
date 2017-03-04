@@ -18,6 +18,7 @@
 
 from __future__ import print_function
 
+import contextlib
 import datetime
 import json
 import os
@@ -88,7 +89,7 @@ keystone_admin_url_opts = [
     cfg.StrOpt('username', default=None),
     cfg.StrOpt('password', default=None),
     cfg.StrOpt('keyfile', default=None),
-    cfg.StrOpt('ssh_server', default=None)
+    cfg.ListOpt('ssh_server', default=None)
 ]
 
 CONF = cfg.CONF
@@ -458,41 +459,49 @@ class Handler(SocketServer.BaseRequestHandler):
         LOG.debug('Tunnel closed from %r' % (peername,))
 
 
-def forward_tunnel(options):
-    server_host, server_port = netutils.parse_host_port(options.ssh_server,
-                                                        SSH_PORT)
-    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
-    remote_host, remote_port = utils.parse_valid_host_port(netloc or
-                                                           options.url)
+@contextlib.contextmanager
+def get_ssh_client(options):
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     client.set_missing_host_key_policy(paramiko.WarningPolicy())
 
-    LOG.info('Connecting to ssh host %s:%d ...' % (server_host, server_port))
+    for ssh_server in options.ssh_server:
+        server_host, server_port = netutils.parse_host_port(ssh_server,
+                                                            SSH_PORT)
+        LOG.info('Connecting to ssh host %s:%d ...' % (server_host,
+                                                       server_port))
+        try:
+            client.connect(server_host, server_port,
+                           username=options.username,
+                           key_filename=options.keyfile or None,
+                           password=options.password or None,
+                           look_for_keys=True)
+            break
+        except Exception as e:
+            LOG.error('*** Failed to connect to %s:%d: %r' % (server_host,
+                                                              server_port, e))
+
     try:
-        client.connect(server_host, server_port,
-                       username=options.username,
-                       key_filename=options.keyfile or None,
-                       password=options.password or None,
-                       look_for_keys=True)
-    except Exception as e:
-        LOG.error('*** Failed to connect to %s:%d: %r' % (server_host,
-                                                          server_port, e))
-        raise
+        yield client
+    finally:
+        client.close()
 
-    LOG.info('Now forwarding port %d to %s:%d ...' % (options.local_port,
-                                                      remote_host,
-                                                      remote_port))
 
-    # this is a little convoluted, but lets me configure things for the Handler
-    # object.  (SocketServer doesn't give Handlers any way to access the outer
-    # server normally.)
-    class SubHander(Handler):
-        chain_host = remote_host
-        chain_port = remote_port
-        ssh_transport = client.get_transport()
-    srv = ForwardServer(('', options.local_port), SubHander)
-    srv.serve_forever()
+def forward_tunnel(options):
+    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
+    remote_host, remote_port = utils.parse_valid_host_port(netloc or
+                                                           options.url)
+
+    with get_ssh_client(options) as client:
+        LOG.info('Now forwarding port %d to %s:%d ...' % (options.local_port,
+                                                          remote_host,
+                                                          remote_port))
+        class SubHander(Handler):
+            chain_host = remote_host
+            chain_port = remote_port
+            ssh_transport = client.get_transport()
+        srv = ForwardServer(('', options.local_port), SubHander)
+        srv.serve_forever()
 
 
 def run_ssh(options):
@@ -508,24 +517,6 @@ def run_ssh(options):
 
 
 def delete_image_from_database(options, image_id):
-    server_host, server_port = netutils.parse_host_port(options.ssh_server,
-                                                        SSH_PORT)
-    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.WarningPolicy())
-
-    LOG.info('Connecting to ssh host %s:%d ...' % (server_host, server_port))
-    try:
-        client.connect(server_host, server_port,
-                       username=options.username,
-                       key_filename=options.keyfile or None,
-                       password=options.password or None,
-                       look_for_keys=True)
-    except Exception as e:
-        LOG.error('*** Failed to connect to %s:%d: %r' % (server_host,
-                                                          server_port, e))
-        raise
     SQL_COMMANDS = [
         "delete from image_locations where image_id='%(id)s';",
         "delete from image_members where image_id='%(id)s';",
@@ -533,14 +524,16 @@ def delete_image_from_database(options, image_id):
         "delete from image_properties where image_id='%(id)s';",
         "delete from images where id='%(id)s';"
     ]
-    cmd = 'echo "%s" | mysql glance'
-    for sql in SQL_COMMANDS:
-        sql = sql % {'id': image_id}
-        LOG.debug(cmd % sql)
-        _stdin, stdout, stderr = client.exec_command(cmd % sql, get_pty=True)
-        LOG.debug(stdout.read())
-        LOG.debug(stderr.read())
-    client.close()
+    CMD = 'echo "%s" | mysql glance'
+    with get_ssh_client(options) as client:
+        for sql_tmpl in SQL_COMMANDS:
+            sql = sql_tmpl % {'id': image_id}
+            command = CMD % sql
+            LOG.debug(command)
+            _stdin, stdout, stderr = client.exec_command(command,
+                                                         get_pty=True)
+            LOG.debug(stdout.read())
+            LOG.debug(stderr.read())
 
 
 def _human_readable_size(num, suffix='B'):
