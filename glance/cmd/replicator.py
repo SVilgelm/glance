@@ -862,6 +862,8 @@ def replication_livecopy(options, args):
                       'image_name': image.get('name', '--unnamed--'),
                       'image_size': image['size']})
             if not options.metaonly:
+                if image['checksum'] is None:
+                    del image['checksum']
                 image_response = master_client.get_image(image_id)
                 try:
                     slave_headers, body = slave_client.add_image(image,
