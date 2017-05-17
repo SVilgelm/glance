@@ -721,12 +721,13 @@ def _image_present(client, image_uuid):
     return 'status' in headers
 
 
-def print_help(options, args):
+def print_help(options):
     """Print help specific to a command.
 
     options: the parsed command line options
     args: the command line
     """
+    args = options.args
     if not args:
         print(COMMANDS)
     else:
