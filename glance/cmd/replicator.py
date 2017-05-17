@@ -22,22 +22,19 @@ import contextlib
 import datetime
 import json
 import os
-import select
+import subprocess
 try:
     import SocketServer
 except ImportError:
     import socketserver as SocketServer
 import sys
-import threading
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils import netutils
-from oslo_utils import uuidutils
 import paramiko
-import six
 from six.moves import http_client as http
 import six.moves.urllib.parse as urlparse
 from webob import exc
@@ -80,12 +77,10 @@ base_opts = [
     cfg.StrOpt('username', default=None),
     cfg.StrOpt('password', default=None),
     cfg.StrOpt('project_name', default=None),
-    cfg.StrOpt('glance_url', default=None)
+    cfg.StrOpt('glance_url', default=None),
+    cfg.BoolOpt('use_ssh_for_db', default=False)
 ]
-keystone_admin_url_opts = [
-    cfg.StrOpt('url', default=None),
-    cfg.BoolOpt('use_ssh_tunnel', default=False),
-    cfg.IntOpt('local_port', default=None),
+ssh_opts = [
     cfg.StrOpt('username', default=None),
     cfg.StrOpt('password', default=None),
     cfg.StrOpt('keyfile', default=None),
@@ -95,9 +90,9 @@ keystone_admin_url_opts = [
 CONF = cfg.CONF
 CONF.register_cli_opts(cli_opts)
 CONF.register_opts(base_opts, 'master')
-CONF.register_opts(keystone_admin_url_opts, 'master_keystone_admin_url')
+CONF.register_opts(ssh_opts, 'master_ssh')
 CONF.register_opts(base_opts, 'slave')
-CONF.register_opts(keystone_admin_url_opts, 'slave_keystone_admin_url')
+CONF.register_opts(ssh_opts, 'slave_ssh')
 logging.register_options(CONF)
 CONF.set_default(name='use_stderr', default=True)
 
@@ -115,10 +110,7 @@ COMMANDS = """Commands:
     help <command>  Output help for one of the commands below
 
     compare         What is missing from the slave glance?
-    dump            Dump the contents of a glance instance to local disk.
     livecopy        Load the contents of one glance instance into another.
-    load            Load the contents of a local directory into glance.
-    size            Determine the size of a glance instance if dumped to disk.
 """
 
 
@@ -415,50 +407,6 @@ class ImageService(HTTPService):
         return headers, body
 
 
-class ForwardServer(SocketServer.ThreadingTCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class Handler(SocketServer.BaseRequestHandler):
-
-    def handle(self):
-        try:
-            chan = self.ssh_transport.open_channel(
-                'direct-tcpip', (self.chain_host, self.chain_port),
-                self.request.getpeername())
-        except Exception as e:
-            LOG.debug('Incoming request to %s:%d failed: %s' % (self.chain_host,
-                                                              self.chain_port,
-                                                              repr(e)))
-            return
-        if chan is None:
-            LOG.debug('Incoming request to %s:%d was rejected by the SSH '
-                      'server.' % (self.chain_host, self.chain_port))
-            return
-
-        LOG.debug('Connected! Tunnel open %r -> %r -> %r' % (
-            self.request.getpeername(),chan.getpeername(),
-            (self.chain_host, self.chain_port)))
-        while True:
-            r, w, x = select.select([self.request, chan], [], [])
-            if self.request in r:
-                data = self.request.recv(1024)
-                if len(data) == 0:
-                    break
-                chan.send(data)
-            if chan in r:
-                data = chan.recv(1024)
-                if len(data) == 0:
-                    break
-                self.request.send(data)
-
-        peername = self.request.getpeername()
-        chan.close()
-        self.request.close()
-        LOG.debug('Tunnel closed from %r' % (peername,))
-
-
 @contextlib.contextmanager
 def get_ssh_client(options):
     client = paramiko.SSHClient()
@@ -487,36 +435,7 @@ def get_ssh_client(options):
         client.close()
 
 
-def forward_tunnel(options):
-    schema, netloc, _, _, _ = netutils.urlsplit(options.url)
-    remote_host, remote_port = utils.parse_valid_host_port(netloc or
-                                                           options.url)
-
-    with get_ssh_client(options) as client:
-        LOG.info('Now forwarding port %d to %s:%d ...' % (options.local_port,
-                                                          remote_host,
-                                                          remote_port))
-        class SubHander(Handler):
-            chain_host = remote_host
-            chain_port = remote_port
-            ssh_transport = client.get_transport()
-        srv = ForwardServer(('', options.local_port), SubHander)
-        srv.serve_forever()
-
-
-def run_ssh(options):
-    if not options.use_ssh_tunnel:
-        return options.url
-
-    thread = threading.Thread(target=forward_tunnel,
-                              kwargs={'options': options})
-    thread.daemon = True
-    thread.start()
-    schema = 'https' if options.url.lower().startswith('https') else 'http'
-    return '%s://127.0.0.1:%d' % (schema, options.local_port)
-
-
-def delete_image_from_database(options, image_id):
+def delete_image_from_database(image_id, use_ssh=False, ssh_options=None):
     SQL_COMMANDS = [
         "delete from image_locations where image_id='%(id)s';",
         "delete from image_members where image_id='%(id)s';",
@@ -525,15 +444,27 @@ def delete_image_from_database(options, image_id):
         "delete from images where id='%(id)s';"
     ]
     CMD = 'echo "%s" | mysql glance'
-    with get_ssh_client(options) as client:
+    if use_ssh:
+        with get_ssh_client(ssh_options) as client:
+            for sql_tmpl in SQL_COMMANDS:
+                sql = sql_tmpl % {'id': image_id}
+                command = CMD % sql
+                LOG.debug(command)
+                _stdin, stdout, stderr = client.exec_command(command,
+                                                             get_pty=True)
+                LOG.debug(stdout.read())
+                LOG.debug(stderr.read())
+    else:
         for sql_tmpl in SQL_COMMANDS:
             sql = sql_tmpl % {'id': image_id}
             command = CMD % sql
             LOG.debug(command)
-            _stdin, stdout, stderr = client.exec_command(command,
-                                                         get_pty=True)
-            LOG.debug(stdout.read())
-            LOG.debug(stderr.read())
+            proc = subprocess.Popen(command, shell=True,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate()
+            LOG.debug(stdout)
+            LOG.debug(stderr)
 
 
 def _human_readable_size(num, suffix='B'):
@@ -542,123 +473,6 @@ def _human_readable_size(num, suffix='B'):
             return "%3.1f %s%s" % (num, unit, suffix)
         num /= 1024.0
     return "%.1f %s%s" % (num, 'Yi', suffix)
-
-
-def replication_test(options, args):
-    from pprint import pprint
-    master_auth_service = AuthService(options.master.auth_url,
-                                      options.master.username,
-                                      options.master.password,
-                                      options.master.project_name)
-
-    master_client = ImageService(options.master.glance_url, master_auth_service)
-    pprint([i for i in master_client.get_images(
-        params={
-            "changes-since": datetime.datetime(2000, 1, 1),
-            'is_public': None
-        }
-    )])
-
-    slave_auth_service = AuthService(options.slave.auth_url,
-                                     options.slave.username,
-                                     options.slave.password,
-                                     options.slave.project_name)
-
-    slave_client = ImageService(options.slave.glance_url, slave_auth_service)
-    pprint([i for i in slave_client.get_images(
-        params={
-            "changes-since": datetime.datetime(2000, 1, 1),
-            'is_public': None
-        }
-    )])
-
-
-def replication_size(options, args):
-    """%(prog)s size <server:port>
-
-    Determine the size of a glance instance if dumped to disk.
-
-    server:port: the location of the glance instance.
-    """
-
-    total_size = 0
-    count = 0
-
-    master_auth_service = AuthService(options.master.auth_url,
-                                      options.master.username,
-                                      options.master.password,
-                                      options.master.project_name)
-    master_client = ImageService(options.master.glance_url, master_auth_service)
-    for image in master_client.get_images():
-        LOG.debug('Considering image: %(image)s', {'image': image})
-        if image['status'] == 'active':
-            total_size += int(image['size'])
-            count += 1
-
-    print(_('Total size is %(size)d bytes (%(human_size)s) across '
-            '%(img_count)d images') %
-          {'size': total_size,
-           'human_size': _human_readable_size(total_size),
-           'img_count': count})
-
-
-def replication_dump(options, args):
-    """%(prog)s dump <server:port> <path>
-
-    Dump the contents of a glance instance to local disk.
-
-    path:        a directory on disk to contain the data.
-    """
-
-    # Make sure server and path are provided
-    if len(args) < 1:
-        raise TypeError(_("Too few arguments."))
-
-    path = args.pop()
-    master_auth_service = AuthService(options.master.auth_url,
-                                      options.master.username,
-                                      options.master.password,
-                                      options.master.project_name)
-    master_client = ImageService(options.master.glance_url, master_auth_service)
-
-    for image in master_client.get_images():
-        LOG.debug('Considering: %(image_id)s (%(image_name)s) '
-                  '(%(image_size)d bytes)',
-                  {'image_id': image['id'],
-                   'image_name': image.get('name', '--unnamed--'),
-                   'image_size': image['size']})
-
-        data_path = os.path.join(path, image['id'])
-        data_filename = data_path + '.img'
-        if not os.path.exists(data_path):
-            LOG.info(_LI('Storing: %(image_id)s (%(image_name)s)'
-                         ' (%(image_size)d bytes) in %(data_filename)s'),
-                     {'image_id': image['id'],
-                      'image_name': image.get('name', '--unnamed--'),
-                      'image_size': image['size'],
-                      'data_filename': data_filename})
-
-            # Dump glance information
-            if six.PY3:
-                f = open(data_path, 'w', encoding='utf-8')
-            else:
-                f = open(data_path, 'w')
-            with f:
-                f.write(jsonutils.dumps(image))
-
-            if image['status'] == 'active' and not options.metaonly:
-                # Now fetch the image. The metadata returned in headers here
-                # is the same as that which we got from the detailed images
-                # request earlier, so we can ignore it here. Note that we also
-                # only dump active images.
-                LOG.debug('Image %s is active', image['id'])
-                image_response = master_client.get_image(image['id'])
-                with open(data_filename, 'wb') as f:
-                    while True:
-                        chunk = image_response.read(options.chunksize)
-                        if not chunk:
-                            break
-                        f.write(chunk)
 
 
 def _dict_diff(a, b):
@@ -688,83 +502,7 @@ def _dict_diff(a, b):
     return False
 
 
-def replication_load(options, args):
-    """%(prog)s load <server:port> <path>
-
-    Load the contents of a local directory into glance.
-
-    server:port: the location of the glance instance.
-    path:        a directory on disk containing the data.
-    """
-
-    # Make sure server and path are provided
-    if len(args) < 1:
-        raise TypeError(_("Too few arguments."))
-
-    path = args.pop()
-
-    slave_auth_service = AuthService(options.slave.auth_url,
-                                      options.slave.username,
-                                      options.slave.password,
-                                      options.slave.project_name)
-    slave_client = ImageService(options.slave.glance_url, slave_auth_service)
-
-    updated = []
-
-    for ent in os.listdir(path):
-        if uuidutils.is_uuid_like(ent):
-            image_uuid = ent
-            LOG.info(_LI('Considering: %s'), image_uuid)
-
-            meta_file_name = os.path.join(path, image_uuid)
-            with open(meta_file_name) as meta_file:
-                meta = jsonutils.loads(meta_file.read())
-
-            # Remove keys which don't make sense for replication
-            for key in options.dontreplicate.split(' '):
-                if key in meta:
-                    LOG.debug('Stripping %(header)s from saved '
-                              'metadata', {'header': key})
-                    del meta[key]
-
-            if _image_present(slave_client, image_uuid):
-                # NOTE(mikal): Perhaps we just need to update the metadata?
-                # Note that we don't attempt to change an image file once it
-                # has been uploaded.
-                LOG.debug('Image %s already present', image_uuid)
-                headers = slave_client.get_image_meta(image_uuid)
-                for key in options.dontreplicate.split(' '):
-                    if key in headers:
-                        LOG.debug('Stripping %(header)s from slave '
-                                  'metadata', {'header': key})
-                        del headers[key]
-
-                if _dict_diff(meta, headers):
-                    LOG.info(_LI('Image %s metadata has changed'), image_uuid)
-                    headers, body = slave_client.add_image_meta(meta)
-                    _check_upload_response_headers(headers, body)
-                    updated.append(meta['id'])
-
-            else:
-                if not os.path.exists(os.path.join(path, image_uuid + '.img')):
-                    LOG.debug('%s dump is missing image data, skipping',
-                              image_uuid)
-                    continue
-
-                # Upload the image itself
-                with open(os.path.join(path, image_uuid + '.img')) as img_file:
-                    try:
-                        headers, body = slave_client.add_image(meta, img_file)
-                        _check_upload_response_headers(headers, body)
-                        updated.append(meta['id'])
-                    except exc.HTTPConflict:
-                        LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE)
-                                  % image_uuid)  # noqa
-
-    return updated
-
-
-def replication_livecopy(options, args):
+def replication_livecopy(options):
     """%(prog)s livecopy
 
     Load the contents of one glance instance into another.
@@ -782,15 +520,13 @@ def replication_livecopy(options, args):
     master_client = ImageService(options.master.glance_url, master_auth_service)
     slave_client = ImageService(options.slave.glance_url, slave_auth_service)
 
-    master_keystone_admin_url = run_ssh(options.master_keystone_admin_url)
-    slave_keystone_admin_url = run_ssh(options.slave_keystone_admin_url)
-
     master_project_service = ProjectService(
-        master_keystone_admin_url,
+        options.master.auth_url,
         master_auth_service)
     slave_project_service = ProjectService(
-        slave_keystone_admin_url,
+        options.slave.auth_url,
         slave_auth_service)
+
     updated = []
 
     for image in master_client.get_images():
@@ -825,8 +561,9 @@ def replication_livecopy(options, args):
                                                      '--unnamed--')})
 
                 slave_client.delete_image(image_id)
-                delete_image_from_database(options.slave_keystone_admin_url,
-                                           image_id)
+                delete_image_from_database(image_id,
+                                           options.slave.use_ssh_for_db,
+                                           options.slave_ssh)
             else:
                 # NOTE(mikal): Perhaps we just need to update the metadata?
                 # Note that we don't attempt to change an image file once it
@@ -876,8 +613,8 @@ def replication_livecopy(options, args):
     return updated
 
 
-def replication_compare(options, args):
-    """%(prog)s compare <fromserver:port> <toserver:port>
+def replication_compare(options):
+    """%(prog)s compare
 
     Compare the contents of master with those of slave.
 
@@ -895,14 +632,11 @@ def replication_compare(options, args):
     master_client = ImageService(options.master.glance_url, master_auth_service)
     slave_client = ImageService(options.slave.glance_url, slave_auth_service)
 
-    master_keystone_admin_url = run_ssh(options.master_keystone_admin_url)
-    slave_keystone_admin_url = run_ssh(options.slave_keystone_admin_url)
-
     master_project_service = ProjectService(
-        master_keystone_admin_url,
+        options.master.auth_url,
         master_auth_service)
     slave_project_service = ProjectService(
-        slave_keystone_admin_url,
+        options.slave.auth_url,
         slave_auth_service)
 
     differences = {}
@@ -1011,11 +745,7 @@ def lookup_command(command_name):
     BASE_COMMANDS = {'help': print_help}
 
     REPLICATION_COMMANDS = {'compare': replication_compare,
-                            'dump': replication_dump,
-                            'livecopy': replication_livecopy,
-                            'load': replication_load,
-                            'test': replication_test,
-                            'size': replication_size,}
+                            'livecopy': replication_livecopy}
 
     commands = {}
     for command_set in (BASE_COMMANDS, REPLICATION_COMMANDS):
@@ -1047,7 +777,7 @@ def main():
     command = lookup_command(CONF.command)
 
     try:
-        command(CONF, CONF.args)
+        command(CONF)
     except Exception as e:
         LOG.exception(e)
         LOG.error(_LE(command.__doc__) % {'prog': command.__name__})  # noqa
