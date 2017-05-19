@@ -28,6 +28,7 @@ try:
 except ImportError:
     import socketserver as SocketServer
 import sys
+import time
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -281,11 +282,14 @@ class ProjectService(HTTPService):
                           )['domains']
 
     def _init_projects(self):
+        t = time.time()
         for domain in self.get_domains():
             for tenant in self.get_tenants(domain['id']):
                 name = '%s/%s' % (domain['name'], tenant['name'])
                 self._projects[tenant['id']] = name
                 self._projects[name] = tenant['id']
+        LOG.info('Discovered %d projects in %s',
+                 len(self._projects) / 2, time.time() - t)
 
     def get_name_or_id(self, project_name_or_id):
         return self._projects.get(project_name_or_id)
@@ -318,7 +322,8 @@ class ImageService(HTTPService):
         if params is None:
             params = {'changes-since': datetime.datetime(2000, 1, 1),
                       'is_public': None}
-
+        i = 0
+        t = time.time()
         while True:
             url = '/v1/images/detail'
             query = urlparse.urlencode(params)
@@ -329,9 +334,11 @@ class ImageService(HTTPService):
             result = jsonutils.loads(response.read())
 
             if not result or 'images' not in result or not result['images']:
+                LOG.info('Discovered %d images in %s', i, time.time() - t)
                 return
             for image in result.get('images', []):
                 params['marker'] = image['id']
+                i += 1
                 yield image
 
     def get_image(self, image_uuid):
@@ -502,6 +509,34 @@ def _dict_diff(a, b):
     return False
 
 
+def _check_upload_response_headers(headers, body):
+    """Check that the headers of an upload are reasonable.
+
+    headers: the headers from the upload
+    body: the body from the upload
+    """
+
+    if 'status' not in headers:
+        try:
+            d = jsonutils.loads(body)
+            if 'image' in d and 'status' in d['image']:
+                return
+
+        except Exception:
+            raise exception.UploadException(body)
+
+
+def diff_images(master_images, slave_images):
+    images = {}
+    for image in master_images:
+        images[image['id']] = {'body': image, 'present': False}
+    for image in slave_images:
+        image_id = image['id']
+        if image_id in images:
+            images[image_id]['present'] = True
+    return images
+
+
 def replication_livecopy(options):
     """%(prog)s livecopy
 
@@ -529,8 +564,11 @@ def replication_livecopy(options):
 
     updated = []
 
-    for image in master_client.get_images():
-        image_id = image['id']
+    original_images = diff_images(master_client.get_images(),
+                                  slave_client.get_images())
+
+    for image_id in original_images:
+        image = original_images[image_id]['body']
         LOG.debug('Considering %(id)s', {'id': image_id})
         for key in options.dontreplicate.split(' '):
             if key in image:
@@ -540,7 +578,7 @@ def replication_livecopy(options):
         master_name = master_project_service.get_name_or_id(image['owner'])
         slave_id = slave_project_service.get_name_or_id(master_name)
         image['owner'] = slave_id
-        if _image_present(slave_client, image_id):
+        if original_images[image_id]['present']:
             slave_headers = slave_client.get_image_meta(image_id)
             if slave_headers['status'] == 'deleted':
                 continue
@@ -639,11 +677,13 @@ def replication_compare(options):
         options.slave.auth_url,
         slave_auth_service)
 
+    original_images = diff_images(master_client.get_images(),
+                                  slave_client.get_images())
     differences = {}
 
-    for image in master_client.get_images():
-        image_id = image['id']
-        if _image_present(slave_client, image_id):
+    for image_id in original_images:
+        image = original_images[image_id]['body']
+        if original_images[image_id]['present']:
             master_headers = master_client.get_image_meta(image_id)
             slave_headers = slave_client.get_image_meta(image_id)
 
@@ -690,35 +730,6 @@ def replication_compare(options):
             differences[image_id] = 'missing'
 
     return differences
-
-
-def _check_upload_response_headers(headers, body):
-    """Check that the headers of an upload are reasonable.
-
-    headers: the headers from the upload
-    body: the body from the upload
-    """
-
-    if 'status' not in headers:
-        try:
-            d = jsonutils.loads(body)
-            if 'image' in d and 'status' in d['image']:
-                return
-
-        except Exception:
-            raise exception.UploadException(body)
-
-
-def _image_present(client, image_uuid):
-    """Check if an image is present in glance.
-
-    client: the ImageService
-    image_uuid: the image uuid to check
-
-    Returns: True if the image is present
-    """
-    headers = client.get_image_meta(image_uuid)
-    return 'status' in headers
 
 
 def print_help(options):
