@@ -19,6 +19,7 @@
 from __future__ import print_function
 
 import contextlib
+import copy
 import datetime
 import json
 import os
@@ -474,41 +475,6 @@ def delete_image_from_database(image_id, use_ssh=False, ssh_options=None):
             LOG.debug(stderr)
 
 
-def _human_readable_size(num, suffix='B'):
-    for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
-        if abs(num) < 1024.0:
-            return "%3.1f %s%s" % (num, unit, suffix)
-        num /= 1024.0
-    return "%.1f %s%s" % (num, 'Yi', suffix)
-
-
-def _dict_diff(a, b):
-    """A one way dictionary diff.
-
-    a: a dictionary
-    b: a dictionary
-
-    Returns: True if the dictionaries are different
-    """
-    # Only things the master has which the slave lacks matter
-    if set(a.keys()) - set(b.keys()):
-        LOG.debug('metadata diff -- master has extra keys: %(keys)s',
-                  {'keys': ' '.join(set(a.keys()) - set(b.keys()))})
-        return True
-
-    for key in a:
-        if str(a[key]) != str(b[key]):
-            LOG.debug('metadata diff -- value differs for key '
-                      '%(key)s: master "%(master_value)s" vs '
-                      'slave "%(slave_value)s"',
-                      {'key': key,
-                       'master_value': a[key],
-                       'slave_value': b[key]})
-            return True
-
-    return False
-
-
 def _check_upload_response_headers(headers, body):
     """Check that the headers of an upload are reasonable.
 
@@ -526,14 +492,60 @@ def _check_upload_response_headers(headers, body):
             raise exception.UploadException(body)
 
 
-def diff_images(master_images, slave_images):
+def diff_images(master_images, slave_images,
+                master_projects, slave_projects,
+                options):
     images = {}
     for image in master_images:
-        images[image['id']] = {'body': image, 'present': False}
+        meta = copy.deepcopy(image)
+        for key in options.dontreplicate.split(' '):
+            if key in meta:
+                del meta[key]
+        master_owner_name = master_projects.get_name_or_id(meta['owner'])
+        slave_owner_id = slave_projects.get_name_or_id(master_owner_name)
+        meta['owner'] = slave_owner_id
+        images[image['id']] = {
+            'master': image,
+            'meta': meta
+        }
+
     for image in slave_images:
         image_id = image['id']
         if image_id in images:
-            images[image_id]['present'] = True
+            meta = images[image_id]['meta']
+            for key in meta.keys():
+                master_value = meta[key]
+                if key in image:
+                    slave_value = image[key]
+                    if str(master_value) == str(slave_value):
+                        del meta[key]
+                    else:
+                        LOG.info(_LI('%(image_id)s "%(name)s": '
+                                     'field %(key)s differs '
+                                     '(source is %(master_value)s, destination '
+                                     'is %(slave_value)s)')
+                                 % {'image_id': image_id,
+                                    'name': image['name'],
+                                    'key': key,
+                                    'master_value': master_value,
+                                    'slave_value': slave_value})
+                else:
+                    meta[key] = None
+                    LOG.info(_LI('%(image_id)s "%(name)s": '
+                                 'field %(key)s differs '
+                                 '(source is %(master_value)s, destination '
+                                 'is %(slave_value)s)')
+                             % {'image_id': image_id,
+                                'name': image['name'],
+                                'key': key,
+                                'master_value': master_value,
+                                'slave_value': None})
+
+            if meta:
+                images[image_id]['slave'] = image
+            else:
+                del images[image_id]
+
     return images
 
 
@@ -562,93 +574,71 @@ def replication_livecopy(options):
         options.slave.auth_url,
         slave_auth_service)
 
-    updated = []
+    images = diff_images(
+        master_client.get_images(),
+        slave_client.get_images(),
+        master_project_service,
+        slave_project_service,
+        options)
 
-    original_images = diff_images(master_client.get_images(),
-                                  slave_client.get_images())
-
-    for image_id in original_images:
-        image = original_images[image_id]['body']
+    for image_id in images:
+        master_image = images[image_id]['master']
+        meta = images[image_id]['meta']
+        slave_image = images[image_id].get('slave')
         LOG.debug('Considering %(id)s', {'id': image_id})
-        for key in options.dontreplicate.split(' '):
-            if key in image:
-                LOG.debug('Stripping %(header)s from master metadata',
-                          {'header': key})
-                del image[key]
-        master_name = master_project_service.get_name_or_id(image['owner'])
-        slave_id = slave_project_service.get_name_or_id(master_name)
-        image['owner'] = slave_id
-        if original_images[image_id]['present']:
-            slave_headers = slave_client.get_image_meta(image_id)
-            if slave_headers['status'] == 'deleted':
+        if slave_image is not None:
+            slave_image = images[image_id]['slave']
+            if slave_image['status'] == 'deleted':
                 continue
 
-            if image['deleted']:
+            if master_image['deleted']:
                 slave_client.delete_image(image_id)
                 LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
                              'has been deleted'),
                          {'image_id': image_id,
-                          'image_name': image.get('name',
-                                                  '--unnamed--')})
+                          'image_name': master_image.get('name',
+                                                         '--unnamed--')})
                 continue
-            elif slave_headers['status'] == 'killed':
+
+            if slave_image['status'] == 'active':
+                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                             'metadata has changed'),
+                         {'image_id': image_id,
+                          'image_name': master_image.get('name',
+                                                         '--unnamed--')})
+                slave_headers, body = slave_client.add_image_meta(meta)
+                _check_upload_response_headers(slave_headers, body)
+                continue
+
+            if slave_image['status'] == 'killed':
                 LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
                                 ' from the database'),
                             {'image_id': image_id,
-                             'image_name': image.get('name',
-                                                     '--unnamed--')})
+                             'image_name': master_image.get('name',
+                                                            '--unnamed--')})
 
                 slave_client.delete_image(image_id)
                 delete_image_from_database(image_id,
                                            options.slave.use_ssh_for_db,
                                            options.slave_ssh)
-            else:
-                # NOTE(mikal): Perhaps we just need to update the metadata?
-                # Note that we don't attempt to change an image file once it
-                # has been uploaded.
-                master_headers = master_client.get_image_meta(image_id)
-                for key in set(master_headers.keys()).difference(
-                        image.keys()):
-                    del master_headers[key]
-                for key in set(slave_headers.keys()).difference(
-                        image.keys()):
-                    del slave_headers[key]
-                master_headers['owner'] = master_project_service.\
-                    get_name_or_id(master_headers['owner'])
-                slave_headers['owner'] = slave_project_service.\
-                    get_name_or_id(slave_headers['owner'])
-                if (slave_headers['status'] == 'active' and
-                        _dict_diff(master_headers, slave_headers)):
-                    LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                                 'metadata has changed'),
-                             {'image_id': image_id,
-                              'image_name': image.get('name',
-                                                      '--unnamed--')})
-                    slave_headers, body = slave_client.add_image_meta(image)
-                    _check_upload_response_headers(slave_headers, body)
-                    updated.append(image['id'])
-                continue
 
-        if image['status'] == 'active':
+        if master_image['status'] == 'active':
             LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
                          '(%(image_size)d bytes) '
                          'is being synced'),
                      {'image_id': image_id,
-                      'image_name': image.get('name', '--unnamed--'),
-                      'image_size': image['size']})
+                      'image_name': master_image.get('name', '--unnamed--'),
+                      'image_size': master_image['size']})
             if not options.metaonly:
-                if image['checksum'] is None:
-                    del image['checksum']
+                if master_image['checksum'] is None and 'checksum' in meta:
+                    del meta['checksum']
                 image_response = master_client.get_image(image_id)
                 try:
-                    slave_headers, body = slave_client.add_image(image,
+                    slave_headers, body = slave_client.add_image(meta,
                                                                  image_response)
                     _check_upload_response_headers(slave_headers, body)
-                    updated.append(image['id'])
                 except exc.HTTPConflict:
                     LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE) % image_id)  # noqa
-
-    return updated
 
 
 def replication_compare(options):
@@ -677,59 +667,20 @@ def replication_compare(options):
         options.slave.auth_url,
         slave_auth_service)
 
-    original_images = diff_images(master_client.get_images(),
-                                  slave_client.get_images())
-    differences = {}
+    images = diff_images(
+        master_client.get_images(),
+        slave_client.get_images(),
+        master_project_service,
+        slave_project_service,
+        options)
 
-    for image_id in original_images:
-        image = original_images[image_id]['body']
-        if original_images[image_id]['present']:
-            master_headers = master_client.get_image_meta(image_id)
-            slave_headers = slave_client.get_image_meta(image_id)
-
-            for key in options.dontreplicate.split(' '):
-                if key in master_headers:
-                    LOG.debug('Stripping %(header)s from master metadata',
-                              {'header': key})
-                    del master_headers[key]
-                if key in slave_headers:
-                    LOG.debug('Stripping %(header)s from slave metadata',
-                              {'header': key})
-                    del slave_headers[key]
-
-            for key in image:
-                master_value = master_headers.get(key)
-                slave_value = slave_headers.get(key)
-                if key == 'owner':
-                    master_value = master_project_service.get_name_or_id(
-                        master_value)
-                    slave_value = slave_project_service.get_name_or_id(slave_value)
-
-                if master_value != slave_value:
-                    LOG.debug('%s is %s', master_value, type(master_value))
-                    LOG.debug('%s is %s', slave_value, type(slave_value))
-                    LOG.warn(_LW('%(image_id)s "%(name)s": '
-                                 'field %(key)s differs '
-                                 '(source is %(master_value)s, destination '
-                                 'is %(slave_value)s)')
-                             % {'image_id': image_id,
-                                'name': image['name'],
-                                'key': key,
-                                'master_value': master_value,
-                                'slave_value': slave_value})
-                    differences[image_id] = 'diff'
-                else:
-                    LOG.debug('%(image_id)s is identical',
-                              {'image_id': image_id})
-
-        elif image['status'] == 'active':
-            LOG.warn(_LW('Image %(image_id)s ("%(image_name)s") '
-                     'entirely missing from the destination')
+    for image_id in images:
+        image = images[image_id]['master']
+        if 'slave' not in images[image_id] and image['status'] == 'active':
+            LOG.info(_LI('Image %(image_id)s ("%(image_name)s") '
+                         'entirely missing from the destination')
                      % {'image_id': image_id,
                         'image_name': image.get('name', '--unnamed--')})
-            differences[image_id] = 'missing'
-
-    return differences
 
 
 def print_help(options):
