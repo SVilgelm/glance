@@ -312,6 +312,7 @@ class ImageService(HTTPService):
                                                      ignore_result_body)
         except exc.HTTPUnauthorized:
             self._auth_token = self.auth_service.get_token()
+            headers['x-auth-token'] = self._auth_token
             return super(ImageService, self).request(method, url, headers, body,
                                                      ignore_result_body)
 
