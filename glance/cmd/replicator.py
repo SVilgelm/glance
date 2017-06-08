@@ -498,6 +498,16 @@ def diff_images(master_images, slave_images,
                 options):
     images = {}
     for image in master_images:
+        if image['disk_format'] is None:
+            LOG.warning(_LW('Image %(image_id)s (%(image_name)s) '
+                            '(%(image_size)d bytes) '
+                            'has been skipped '
+                            'due to disk_format is None'),
+                        {'image_id': image['id'],
+                         'image_name': image.get('name', '--unnamed--'),
+                         'image_size': image['size']})
+
+            continue
         meta = copy.deepcopy(image)
         for key in options.dontreplicate.split(' '):
             if key in meta:
