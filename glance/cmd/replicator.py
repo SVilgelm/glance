@@ -54,13 +54,9 @@ SSH_PORT = 22
 # NOTE: positional arguments <args> will be parsed before <command> until
 # this bug is corrected https://bugs.launchpad.net/oslo.config/+bug/1392428
 cli_opts = [
-    cfg.IntOpt('chunksize',
-               short='c',
-               default=65536,
-               help="Amount of data to transfer per HTTP write."),
     cfg.StrOpt('dontreplicate',
                short='D',
-               default=('created_at date deleted_at location updated_at'),
+               default='created_at date deleted_at location updated_at',
                help="List of fields to not replicate."),
     cfg.BoolOpt('metaonly',
                 short='m',
@@ -553,6 +549,8 @@ def diff_images(master_images, slave_images,
                                 'slave_value': None})
 
             if meta:
+                meta['id'] = image_id
+                meta['size'] = images[image_id]['master']['size']
                 images[image_id]['slave'] = image
             else:
                 del images[image_id]
@@ -597,59 +595,77 @@ def replication_livecopy(options):
         meta = images[image_id]['meta']
         slave_image = images[image_id].get('slave')
         LOG.debug('Considering %(id)s', {'id': image_id})
-        if slave_image is not None:
-            slave_image = images[image_id]['slave']
-            if slave_image['status'] == 'deleted':
-                continue
+        try:
+            if slave_image is not None:
+                slave_image = images[image_id]['slave']
+                if slave_image['status'] == 'deleted':
+                    continue
 
-            if master_image['deleted']:
-                slave_client.delete_image(image_id)
-                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                             'has been deleted'),
-                         {'image_id': image_id,
-                          'image_name': master_image.get('name',
-                                                         '--unnamed--')})
-                continue
+                if master_image['deleted']:
+                    slave_client.delete_image(image_id)
+                    LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                                 'has been deleted'),
+                             {'image_id': image_id,
+                              'image_name': master_image.get('name',
+                                                             '--unnamed--')})
+                    continue
 
-            if slave_image['status'] == 'active':
-                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                             'metadata has changed'),
-                         {'image_id': image_id,
-                          'image_name': master_image.get('name',
-                                                         '--unnamed--')})
-                slave_headers, body = slave_client.add_image_meta(meta)
-                _check_upload_response_headers(slave_headers, body)
-                continue
-
-            if slave_image['status'] == 'killed':
-                LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
-                                ' from the database'),
-                            {'image_id': image_id,
-                             'image_name': master_image.get('name',
-                                                            '--unnamed--')})
-
-                slave_client.delete_image(image_id)
-                delete_image_from_database(image_id,
-                                           options.slave.use_ssh_for_db,
-                                           options.slave_ssh)
-
-        if master_image['status'] == 'active':
-            LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
-                         '(%(image_size)d bytes) '
-                         'is being synced'),
-                     {'image_id': image_id,
-                      'image_name': master_image.get('name', '--unnamed--'),
-                      'image_size': master_image['size']})
-            if not options.metaonly:
-                if master_image['checksum'] is None and 'checksum' in meta:
-                    del meta['checksum']
-                image_response = master_client.get_image(image_id)
-                try:
-                    slave_headers, body = slave_client.add_image(meta,
-                                                                 image_response)
+                if slave_image['status'] == 'active':
+                    LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                                 'metadata has changed'),
+                             {'image_id': image_id,
+                              'image_name': master_image.get('name',
+                                                             '--unnamed--')})
+                    slave_headers, body = slave_client.add_image_meta(meta)
                     _check_upload_response_headers(slave_headers, body)
-                except exc.HTTPConflict:
-                    LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE) % image_id)  # noqa
+                    continue
+
+                if slave_image['status'] == 'killed':
+                    LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
+                                    ' from the database'),
+                                {'image_id': image_id,
+                                 'image_name': master_image.get('name',
+                                                                '--unnamed--')})
+
+                    slave_client.delete_image(image_id)
+                    delete_image_from_database(image_id,
+                                               options.slave.use_ssh_for_db,
+                                               options.slave_ssh)
+                else:
+                    LOG.warning(_LI('Image %(image_id)s (%(image_name)s) '
+                                    'with status %(image_status)s on destination'
+                                    'has been skipped'),
+                                {'image_id': image_id,
+                                 'image_name': master_image.get('name',
+                                                                '--unnamed--'),
+                                 'image_status': slave_image['status']
+                                 })
+                    continue
+
+            if master_image['status'] == 'active':
+                LOG.info(_LI('Image %(image_id)s (%(image_name)s) '
+                             '(%(image_size)d bytes) '
+                             'is being synced'),
+                         {'image_id': image_id,
+                          'image_name': master_image.get('name', '--unnamed--'),
+                          'image_size': master_image['size']})
+                if not options.metaonly:
+                    if master_image['checksum'] is None and 'checksum' in meta:
+                        del meta['checksum']
+                    image_response = master_client.get_image(image_id)
+                    try:
+                        slave_headers, body = slave_client.add_image(meta,
+                                                                     image_response)
+                        _check_upload_response_headers(slave_headers, body)
+                    except exc.HTTPConflict:
+                        LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE) % image_id)  # noqa
+        except Exception as e:
+            LOG.exception(e)
+            LOG.error(_LE('Copying of the image %(image_id)s (%(image_name)s): '
+                          'has been failed'),
+                      {'image_id': image_id,
+                       'image_name': master_image.get('name', '--unnamed--')})
+            continue
 
 
 def replication_compare(options):
@@ -742,7 +758,7 @@ def main():
         config.parse_args()
     except RuntimeError as e:
         sys.exit("ERROR: %s" % encodeutils.exception_to_unicode(e))
-    except SystemExit as e:
+    except SystemExit:
         sys.exit("Please specify one command")
 
     # Setup logging
