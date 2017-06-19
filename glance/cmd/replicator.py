@@ -508,15 +508,20 @@ def diff_images(master_images, slave_images,
         for key in options.dontreplicate.split(' '):
             if key in meta:
                 del meta[key]
+        if 'checksum' in meta and meta['checksum'] is None:
+            del meta['checksum']
+
         master_owner_name = master_projects.get_name_or_id(meta['owner'])
         slave_owner_id = slave_projects.get_name_or_id(master_owner_name)
         meta['owner'] = slave_owner_id
         images[image['id']] = {
             'master': image,
-            'meta': meta
+            'meta': meta,
+            'full_meta': copy.deepcopy(meta)
         }
 
     for image in slave_images:
+        fields = {}
         image_id = image['id']
         if image_id in images:
             meta = images[image_id]['meta']
@@ -527,34 +532,30 @@ def diff_images(master_images, slave_images,
                     if str(master_value) == str(slave_value):
                         del meta[key]
                     else:
-                        LOG.info(_LI('%(image_id)s "%(name)s": '
-                                     'field %(key)s differs '
-                                     '(source is %(master_value)s, destination '
-                                     'is %(slave_value)s)')
-                                 % {'image_id': image_id,
-                                    'name': image['name'],
-                                    'key': key,
-                                    'master_value': master_value,
-                                    'slave_value': slave_value})
+                        fields[key] = {
+                            'source': master_value,
+                            'destination': slave_value
+                        }
                 else:
                     meta[key] = None
-                    LOG.info(_LI('%(image_id)s "%(name)s": '
-                                 'field %(key)s differs '
-                                 '(source is %(master_value)s, destination '
-                                 'is %(slave_value)s)')
-                             % {'image_id': image_id,
-                                'name': image['name'],
-                                'key': key,
-                                'master_value': master_value,
-                                'slave_value': None})
+                    fields[key] = {
+                        'source': master_value,
+                        'destination': None
+                    }
 
             if meta:
                 meta['id'] = image_id
-                meta['size'] = images[image_id]['master']['size']
+                meta['size'] = images[image_id]['full_meta']['size']
                 images[image_id]['slave'] = image
             else:
                 del images[image_id]
-
+        if fields:
+            LOG.info(_LI('%(image_id)s "%(name)s": '
+                         'fields on source and destination are different: '
+                         '%(fields)s'
+                     % {'image_id': image_id,
+                        'name': image['name'],
+                        'fields': fields}))
     return images
 
 
@@ -620,7 +621,7 @@ def replication_livecopy(options):
                     _check_upload_response_headers(slave_headers, body)
                     continue
 
-                if slave_image['status'] == 'killed':
+                if slave_image['status'] in ('killed', 'queued'):
                     LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
                                     ' from the database'),
                                 {'image_id': image_id,
@@ -631,6 +632,7 @@ def replication_livecopy(options):
                     delete_image_from_database(image_id,
                                                options.slave.use_ssh_for_db,
                                                options.slave_ssh)
+                    meta = images[image_id]['full_meta']
                 else:
                     LOG.warning(_LI('Image %(image_id)s (%(image_name)s) '
                                     'with status %(image_status)s on destination'
@@ -649,16 +651,13 @@ def replication_livecopy(options):
                          {'image_id': image_id,
                           'image_name': master_image.get('name', '--unnamed--'),
                           'image_size': master_image['size']})
-                if not options.metaonly:
-                    if master_image['checksum'] is None and 'checksum' in meta:
-                        del meta['checksum']
-                    image_response = master_client.get_image(image_id)
-                    try:
-                        slave_headers, body = slave_client.add_image(meta,
-                                                                     image_response)
-                        _check_upload_response_headers(slave_headers, body)
-                    except exc.HTTPConflict:
-                        LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE) % image_id)  # noqa
+                image_response = master_client.get_image(image_id)
+                try:
+                    slave_headers, body = slave_client.add_image(meta,
+                                                                 image_response)
+                    _check_upload_response_headers(slave_headers, body)
+                except exc.HTTPConflict:
+                    LOG.error(_LE(IMAGE_ALREADY_PRESENT_MESSAGE) % image_id)  # noqa
         except Exception as e:
             LOG.exception(e)
             LOG.error(_LE('Copying of the image %(image_id)s (%(image_name)s): '
