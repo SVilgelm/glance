@@ -49,7 +49,7 @@ from glance.i18n import _, _LE, _LI, _LW
 LOG = logging.getLogger(__name__)
 
 SSH_PORT = 22
-
+TWO_HOURS = 2 * 60 * 60
 
 # NOTE: positional arguments <args> will be parsed before <command> until
 # this bug is corrected https://bugs.launchpad.net/oslo.config/+bug/1392428
@@ -127,7 +127,7 @@ class HTTPService(object):
             cls = http.HTTPSConnection
         else:
             cls = http.HTTPConnection
-        self.conn = cls(server, port)
+        self.conn = cls(server, port, timeout=TWO_HOURS)
 
     @staticmethod
     def header_list_to_dict(headers):
@@ -634,7 +634,7 @@ def replication_livecopy(options):
 
                 if slave_image['status'] in ('killed', 'queued', 'saving'):
                     if slave_image['status'] == 'saving':
-                        if slave_image['__time_delta__'].total_seconds() < 2 * 60 * 60:  # 2 hours
+                        if slave_image['__time_delta__'].total_seconds() < TWO_HOURS:  # 2 hours
                             continue
                         LOG.warning(_LW('Image %(image_id)s (%(image_name)s) '
                                         'stuck in saving status for %(delta)s'),
