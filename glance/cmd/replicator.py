@@ -329,6 +329,10 @@ class ImageService(HTTPService):
                 url += '?%s' % query
 
             response = self.request('GET', url, {}, '')
+            headers = response.getheaders()
+            current_time = datetime.datetime.strptime(
+                self.header_list_to_dict(headers)['date'],
+                '%a, %d %b %Y %H:%M:%S %Z')
             result = jsonutils.loads(response.read())
 
             if not result or 'images' not in result or not result['images']:
@@ -337,6 +341,10 @@ class ImageService(HTTPService):
             for image in result.get('images', []):
                 params['marker'] = image['id']
                 i += 1
+                created_time = datetime.datetime.strptime(
+                    image['created_at'],
+                    '%Y-%m-%dT%H:%M:%S.%f')
+                image['__time_delta__'] = current_time - created_time
                 yield image
 
     def get_image(self, image_uuid):
@@ -501,12 +509,15 @@ def diff_images(master_images, slave_images,
                             'due to disk_format is None'),
                         {'image_id': image['id'],
                          'image_name': image.get('name', '--unnamed--'),
-                         'image_size': image['size']})
+                         'image_size': image['size'] or 0})
 
             continue
         meta = copy.deepcopy(image)
         for key in options.dontreplicate.split(' '):
             if key in meta:
+                del meta[key]
+        for key in image.keys()[:]:
+            if key.startswith('__') and key.endswith('__'):
                 del meta[key]
         if 'checksum' in meta and meta['checksum'] is None:
             del meta['checksum']
@@ -621,8 +632,16 @@ def replication_livecopy(options):
                     _check_upload_response_headers(slave_headers, body)
                     continue
 
-                if slave_image['status'] in ('killed', 'queued'):
-                    LOG.warning(_LI('Remove image %(image_id)s (%(image_name)s)'
+                if slave_image['status'] in ('killed', 'queued', 'saving'):
+                    if slave_image['status'] == 'saving':
+                        if slave_image['__time_delta__'].total_seconds() < 2 * 60 * 60:  # 2 hours
+                            continue
+                        LOG.warning(_LW('Image %(image_id)s (%(image_name)s) '
+                                        'stuck in saving status for %(delta)s'),
+                                    {'image_id': image_id,
+                                     'image_name': master_image.get('name', '--unnamed--'),
+                                     'delta': slave_image['__time_delta__']})
+                    LOG.warning(_LW('Remove image %(image_id)s (%(image_name)s)'
                                     ' from the database'),
                                 {'image_id': image_id,
                                  'image_name': master_image.get('name',
