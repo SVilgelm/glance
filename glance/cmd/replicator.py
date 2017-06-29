@@ -521,6 +521,8 @@ def diff_images(master_images, slave_images,
                 del meta[key]
         if 'checksum' in meta and meta['checksum'] is None:
             del meta['checksum']
+        if 'status' in meta:
+            del meta['status']
 
         master_owner_name = master_projects.get_name_or_id(meta['owner'])
         slave_owner_id = slave_projects.get_name_or_id(master_owner_name)
